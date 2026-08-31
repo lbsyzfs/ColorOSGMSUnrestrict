@@ -51,6 +51,23 @@ google_restric_info=0
 
 这比直接 `return` 更适合清理已经存在的限制状态。
 
+为避免 ART 将短方法内联后绕过 Hook，模块会在安装 Hook 前反优化调用者：
+
+```text
+handleMessage() --调用/可能内联--> K()
+K()             --调用/可能内联--> C()
+```
+
+因此实际执行的是：
+
+```text
+deoptimize(handleMessage)  # 让 K Hook 可见
+deoptimize(K)              # 让 C Hook 可见
+安装 K/C Hook
+```
+
+这里反优化的是被 Hook 方法的调用者，而不是简单地反优化被 Hook 方法本身。
+
 ## 默认受 ColorOS UID policy 控制的包
 
 在当前 ColorOS 16 样本中，`google_network_restriction_list` 默认包含：
@@ -107,6 +124,7 @@ logcat -d | grep -E 'ColorOSGMSUnrestrict|GoogleController'
 出现类似日志表示 Hook 已命中：
 
 ```text
+ColorOSGMSUnrestrict: deoptimize complete: handleMessage=true, K=true
 ColorOSGMSUnrestrict: hooks installed ...
 ColorOSGMSUnrestrict: K: restricted=true -> false
 ColorOSGMSUnrestrict: C: blocked UID policy request -> unrestrict path
@@ -140,7 +158,7 @@ settings get global oplus_comm_trafficmonitor_gms_network_control
 
 - JDK 17
 - Android SDK 36
-- Gradle 8.13
+- Gradle 9.6
 
 构建：
 

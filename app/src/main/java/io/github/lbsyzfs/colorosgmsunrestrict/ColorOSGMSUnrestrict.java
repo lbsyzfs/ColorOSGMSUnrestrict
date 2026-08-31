@@ -1,5 +1,6 @@
 package io.github.lbsyzfs.colorosgmsunrestrict;
 
+import android.os.Message;
 import android.util.Log;
 
 import java.lang.reflect.Method;
@@ -32,6 +33,7 @@ public final class ColorOSGMSUnrestrict extends XposedModule {
     private static final String TARGET_PACKAGE = "com.oplus.battery";
     private static final String TARGET_CLASS =
             "com.oplus.battery.restrictdynamicfeature.google.GoogleRestrictionController";
+    private static final String TARGET_HANDLER_CLASS = TARGET_CLASS + "$b";
 
     private final AtomicBoolean installed = new AtomicBoolean(false);
 
@@ -101,6 +103,10 @@ public final class ColorOSGMSUnrestrict extends XposedModule {
                 stateMethod.setAccessible(true);
                 policyMethod.setAccessible(true);
 
+                // ART may have inlined K into handleMessage and C into K. Deoptimizing the
+                // callers before installing the hooks makes those calls observable again.
+                deoptimizeCallers(classLoader, stateMethod);
+
                 var stateHandle = hook(stateMethod)
                         .setExceptionMode(ExceptionMode.PROTECTIVE)
                         .intercept(chain -> {
@@ -150,6 +156,38 @@ public final class ColorOSGMSUnrestrict extends XposedModule {
                 log(Log.ERROR, TAG, "hook installation failed at " + stage, t);
             }
         }
+    }
+
+    private void deoptimizeCallers(ClassLoader classLoader, Method stateMethod) {
+        Boolean handlerResult = null;
+        Boolean stateResult = null;
+
+        try {
+            Class<?> handlerClass = classLoader.loadClass(TARGET_HANDLER_CLASS);
+            Method handleMessage = handlerClass.getDeclaredMethod("handleMessage", Message.class);
+            handleMessage.setAccessible(true);
+            handlerResult = deoptimize(handleMessage);
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG,
+                    "deoptimize handleMessage failed; K hook may miss an inlined call", t);
+        }
+
+        try {
+            // K is the caller of C, so deoptimizing K prevents an inlined C from bypassing
+            // the policy hook. Use the resolved method in case an OTA changed its name.
+            stateResult = deoptimize(stateMethod);
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG,
+                    "deoptimize K caller failed; C hook may miss an inlined call", t);
+        }
+
+        log(Log.INFO, TAG,
+                "deoptimize complete: handleMessage=" + formatDeoptResult(handlerResult)
+                        + ", K=" + formatDeoptResult(stateResult));
+    }
+
+    private static String formatDeoptResult(Boolean result) {
+        return result == null ? "unavailable" : result.toString();
     }
 
     /**
