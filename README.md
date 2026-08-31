@@ -51,22 +51,24 @@ google_restric_info=0
 
 这比直接 `return` 更适合清理已经存在的限制状态。
 
-为避免 ART 将短方法内联后绕过 Hook，模块会在安装 Hook 前反优化调用者：
+`handleMessage()` 实际通过编译器生成的静态桥接方法调用私有的 K/C：
 
 ```text
-handleMessage() --调用/可能内联--> K()
-K()             --调用/可能内联--> C()
+handleMessage() -> w(controller, restricted, ...) -> K(restricted, ...)
+handleMessage() -> t(controller, restricted, ...) -> C(restricted, ...)
 ```
 
-因此实际执行的是：
+这些桥接方法很短，ART 可能把 K/C 内联进去，从而绕过只安装在 K/C 上的 Hook。
+因此模块会反优化并同时 Hook 桥接层与原始方法：
 
 ```text
-deoptimize(handleMessage)  # 让 K Hook 可见
-deoptimize(K)              # 让 C Hook 可见
-安装 K/C Hook
+deoptimize(handleMessage)
+deoptimize(w/t)
+deoptimize(K)
+安装 w/t 与 K/C Hook
 ```
 
-这里反优化的是被 Hook 方法的调用者，而不是简单地反优化被 Hook 方法本身。
+桥接层负责拦住已内联的执行路径，K/C Hook 则覆盖未内联或其它直接调用路径。
 
 ## 默认受 ColorOS UID policy 控制的包
 
@@ -124,10 +126,10 @@ logcat -d | grep -E 'ColorOSGMSUnrestrict|GoogleController'
 出现类似日志表示 Hook 已命中：
 
 ```text
-ColorOSGMSUnrestrict: deoptimize complete: handleMessage=true, K=true
+ColorOSGMSUnrestrict: deoptimize complete: handleMessage=true, stateBridge=true, policyBridge=true, K=true
 ColorOSGMSUnrestrict: hooks installed ...
-ColorOSGMSUnrestrict: K: restricted=true -> false
-ColorOSGMSUnrestrict: C: blocked UID policy request -> unrestrict path
+ColorOSGMSUnrestrict: state bridge: restricted=true -> false
+ColorOSGMSUnrestrict: policy bridge: blocked request -> unrestrict path
 ```
 
 查看 ColorOS 当前记录的限制状态：

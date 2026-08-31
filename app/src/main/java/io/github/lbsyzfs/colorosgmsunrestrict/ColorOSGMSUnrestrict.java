@@ -93,7 +93,28 @@ public final class ColorOSGMSUnrestrict extends XposedModule {
                         Set.class
                 );
 
-                if (stateMethod == null || policyMethod == null) {
+                // The nested Handler calls compiler-generated access bridges w/t rather
+                // than K/C directly. ART may inline K/C into those tiny bridges, bypassing
+                // hooks on the private methods even after handleMessage is deoptimized.
+                Method stateBridge = findMethod(
+                        controller,
+                        "w",
+                        controller,
+                        boolean.class,
+                        boolean.class,
+                        int.class
+                );
+
+                Method policyBridge = findMethod(
+                        controller,
+                        "t",
+                        controller,
+                        boolean.class,
+                        Set.class
+                );
+
+                if (stateMethod == null || policyMethod == null
+                        || stateBridge == null || policyBridge == null) {
                     log(Log.ERROR, TAG,
                             "target methods not found at " + stage
                                     + "; ColorOS version may have changed");
@@ -102,21 +123,21 @@ public final class ColorOSGMSUnrestrict extends XposedModule {
 
                 stateMethod.setAccessible(true);
                 policyMethod.setAccessible(true);
+                stateBridge.setAccessible(true);
+                policyBridge.setAccessible(true);
 
-                // ART may have inlined K into handleMessage and C into K. Deoptimizing the
-                // callers before installing the hooks makes those calls observable again.
-                deoptimizeCallers(classLoader, stateMethod);
+                deoptimizeCallers(classLoader, stateBridge, policyBridge, stateMethod);
 
-                var stateHandle = hook(stateMethod)
+                var stateBridgeHandle = hook(stateBridge)
                         .setExceptionMode(ExceptionMode.PROTECTIVE)
                         .intercept(chain -> {
                             Object[] args = chain.getArgs().toArray();
-                            boolean wasRestricted = Boolean.TRUE.equals(args[0]);
-                            args[0] = Boolean.FALSE;
+                            boolean wasRestricted = Boolean.TRUE.equals(args[1]);
+                            args[1] = Boolean.FALSE;
 
                             if (wasRestricted) {
                                 log(Log.INFO, TAG,
-                                        "K: restricted=true -> false, method="
+                                        "state bridge: restricted=true -> false, method="
                                                 + chain.getExecutable().getName());
                             }
 
@@ -124,23 +145,65 @@ public final class ColorOSGMSUnrestrict extends XposedModule {
                         });
 
                 try {
-                    hook(policyMethod)
+                    var policyBridgeHandle = hook(policyBridge)
                             .setExceptionMode(ExceptionMode.PROTECTIVE)
                             .intercept(chain -> {
                                 Object[] args = chain.getArgs().toArray();
-                                boolean wasRestricted = Boolean.TRUE.equals(args[0]);
-                                args[0] = Boolean.FALSE;
+                                boolean wasRestricted = Boolean.TRUE.equals(args[1]);
+                                args[1] = Boolean.FALSE;
 
                                 if (wasRestricted) {
                                     log(Log.INFO, TAG,
-                                            "C: blocked UID policy request -> unrestrict path, method="
+                                            "policy bridge: blocked request -> unrestrict path, method="
                                                     + chain.getExecutable().getName());
                                 }
 
                                 return chain.proceed(args);
                             });
+
+                    try {
+                        var stateHandle = hook(stateMethod)
+                                .setExceptionMode(ExceptionMode.PROTECTIVE)
+                                .intercept(chain -> {
+                                    Object[] args = chain.getArgs().toArray();
+                                    boolean wasRestricted = Boolean.TRUE.equals(args[0]);
+                                    args[0] = Boolean.FALSE;
+
+                                    if (wasRestricted) {
+                                        log(Log.INFO, TAG,
+                                                "K: restricted=true -> false, method="
+                                                        + chain.getExecutable().getName());
+                                    }
+
+                                    return chain.proceed(args);
+                                });
+
+                        try {
+                            hook(policyMethod)
+                                    .setExceptionMode(ExceptionMode.PROTECTIVE)
+                                    .intercept(chain -> {
+                                        Object[] args = chain.getArgs().toArray();
+                                        boolean wasRestricted = Boolean.TRUE.equals(args[0]);
+                                        args[0] = Boolean.FALSE;
+
+                                        if (wasRestricted) {
+                                            log(Log.INFO, TAG,
+                                                    "C: blocked UID policy request -> unrestrict path, method="
+                                                            + chain.getExecutable().getName());
+                                        }
+
+                                        return chain.proceed(args);
+                                    });
+                        } catch (Throwable t) {
+                            stateHandle.unhook();
+                            throw t;
+                        }
+                    } catch (Throwable t) {
+                        policyBridgeHandle.unhook();
+                        throw t;
+                    }
                 } catch (Throwable t) {
-                    stateHandle.unhook();
+                    stateBridgeHandle.unhook();
                     throw t;
                 }
 
@@ -148,7 +211,9 @@ public final class ColorOSGMSUnrestrict extends XposedModule {
                 log(Log.INFO, TAG,
                         "hooks installed at " + stage
                                 + ": state=" + stateMethod.toGenericString()
-                                + ", policy=" + policyMethod.toGenericString());
+                                + ", policy=" + policyMethod.toGenericString()
+                                + ", stateBridge=" + stateBridge.toGenericString()
+                                + ", policyBridge=" + policyBridge.toGenericString());
             } catch (ClassNotFoundException e) {
                 log(Log.WARN, TAG,
                         TARGET_CLASS + " not available at " + stage + ", will retry if possible");
@@ -158,8 +223,15 @@ public final class ColorOSGMSUnrestrict extends XposedModule {
         }
     }
 
-    private void deoptimizeCallers(ClassLoader classLoader, Method stateMethod) {
+    private void deoptimizeCallers(
+            ClassLoader classLoader,
+            Method stateBridge,
+            Method policyBridge,
+            Method stateMethod
+    ) {
         Boolean handlerResult = null;
+        Boolean stateBridgeResult = null;
+        Boolean policyBridgeResult = null;
         Boolean stateResult = null;
 
         try {
@@ -173,6 +245,20 @@ public final class ColorOSGMSUnrestrict extends XposedModule {
         }
 
         try {
+            stateBridgeResult = deoptimize(stateBridge);
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG,
+                    "deoptimize state bridge failed; K hook may miss an inlined call", t);
+        }
+
+        try {
+            policyBridgeResult = deoptimize(policyBridge);
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG,
+                    "deoptimize policy bridge failed; C hook may miss an inlined call", t);
+        }
+
+        try {
             // K is the caller of C, so deoptimizing K prevents an inlined C from bypassing
             // the policy hook. Use the resolved method in case an OTA changed its name.
             stateResult = deoptimize(stateMethod);
@@ -183,6 +269,8 @@ public final class ColorOSGMSUnrestrict extends XposedModule {
 
         log(Log.INFO, TAG,
                 "deoptimize complete: handleMessage=" + formatDeoptResult(handlerResult)
+                        + ", stateBridge=" + formatDeoptResult(stateBridgeResult)
+                        + ", policyBridge=" + formatDeoptResult(policyBridgeResult)
                         + ", K=" + formatDeoptResult(stateResult));
     }
 
