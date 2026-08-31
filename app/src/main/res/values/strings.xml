@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ColorOS GMS 解限</string>
+    <string name="app_description">解除 ColorOS 16 对 Google 服务的动态联网限制</string>
+</resources>
