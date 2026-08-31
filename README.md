@@ -158,7 +158,7 @@ settings get global oplus_comm_trafficmonitor_gms_network_control
 
 - JDK 17
 - Android SDK 36
-- Gradle 9.6
+- Gradle 9.5+
 
 构建：
 
