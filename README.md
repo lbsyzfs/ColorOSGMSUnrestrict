@@ -70,6 +70,17 @@ deoptimize(K)
 
 桥接层负责拦住已内联的执行路径，K/C Hook 则覆盖未内联或其它直接调用路径。
 
+如果模块启动时设备已经处于限制状态，控制器不一定会立即再次调用 K/C，数据库里的
+`google_restric_info=1` 和已有 UID policy 因而可能继续残留。模块还会在应用启动后
+主动执行一次清理：
+
+```text
+Settings.Secure[google_restric_info] = 0
+C(false, emptySet) -> setUidPolicy(uid, 0)
+```
+
+后续状态变化仍由上述 Hook 拦截，避免限制被重新启用。
+
 ## 默认受 ColorOS UID policy 控制的包
 
 在当前 ColorOS 16 样本中，`google_network_restriction_list` 默认包含：
@@ -132,6 +143,8 @@ ColorOSGMSUnrestrict: state bridge: restricted=true -> false
 ColorOSGMSUnrestrict: policy bridge: blocked request -> unrestrict path
 ```
 
+启动清理成功时还会出现 `persisted restriction state cleared` 和
+`persisted UID policies cleared`。
 查看 ColorOS 当前记录的限制状态：
 
 ```sh

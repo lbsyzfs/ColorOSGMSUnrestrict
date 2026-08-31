@@ -1,12 +1,19 @@
 package io.github.lbsyzfs.colorosgmsunrestrict;
 
+import android.annotation.SuppressLint;
+import android.app.Application;
+import android.content.Context;
 import android.os.Message;
+import android.provider.Settings;
 import android.util.Log;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import io.github.libxposed.api.XposedInterface.ExceptionMode;
 import io.github.libxposed.api.XposedModule;
@@ -34,8 +41,15 @@ public final class ColorOSGMSUnrestrict extends XposedModule {
     private static final String TARGET_CLASS =
             "com.oplus.battery.restrictdynamicfeature.google.GoogleRestrictionController";
     private static final String TARGET_HANDLER_CLASS = TARGET_CLASS + "$b";
+    private static final String RESTRICTION_SETTING = "google_restric_info";
 
     private final AtomicBoolean installed = new AtomicBoolean(false);
+    private final AtomicBoolean startupCleanupHookInstalled = new AtomicBoolean(false);
+    private final AtomicBoolean applicationReady = new AtomicBoolean(false);
+    private final AtomicBoolean uidPolicyCleared = new AtomicBoolean(false);
+    private final AtomicBoolean persistedStateCleared = new AtomicBoolean(false);
+    private final AtomicReference<Object> controllerInstance = new AtomicReference<>();
+    private volatile Method cleanupPolicyMethod;
 
     @Override
     public void onModuleLoaded(ModuleLoadedParam param) {
@@ -63,6 +77,11 @@ public final class ColorOSGMSUnrestrict extends XposedModule {
         if (!installed.get()) {
             tryInstall(param.getClassLoader(), "onPackageReady");
         }
+
+        installStartupCleanupHook(
+                param.getClassLoader(),
+                param.getApplicationInfo().className
+        );
     }
 
     private void tryInstall(ClassLoader classLoader, String stage) {
@@ -125,6 +144,9 @@ public final class ColorOSGMSUnrestrict extends XposedModule {
                 policyMethod.setAccessible(true);
                 stateBridge.setAccessible(true);
                 policyBridge.setAccessible(true);
+
+                cleanupPolicyMethod = policyMethod;
+                installControllerLifecycleHooks(controller);
 
                 deoptimizeCallers(classLoader, stateBridge, policyBridge, stateMethod);
 
@@ -219,6 +241,143 @@ public final class ColorOSGMSUnrestrict extends XposedModule {
                         TARGET_CLASS + " not available at " + stage + ", will retry if possible");
             } catch (Throwable t) {
                 log(Log.ERROR, TAG, "hook installation failed at " + stage, t);
+            }
+        }
+    }
+
+    private void installControllerLifecycleHooks(Class<?> controller) {
+        int hookCount = 0;
+
+        for (Constructor<?> constructor : controller.getDeclaredConstructors()) {
+            try {
+                constructor.setAccessible(true);
+                hook(constructor)
+                        .setExceptionMode(ExceptionMode.PROTECTIVE)
+                        .intercept(chain -> {
+                            Object result = chain.proceed();
+                            Object instance = chain.getThisObject();
+
+                            if (instance != null) {
+                                controllerInstance.compareAndSet(null, instance);
+                                if (applicationReady.get()) {
+                                    clearUidPolicies();
+                                }
+                            }
+
+                            return result;
+                        });
+                hookCount++;
+            } catch (Throwable t) {
+                log(Log.ERROR, TAG,
+                        "controller constructor hook failed: " + constructor.toGenericString(), t);
+            }
+        }
+
+        log(Log.INFO, TAG, "controller constructor hooks installed: " + hookCount);
+    }
+
+    private void installStartupCleanupHook(ClassLoader classLoader, String applicationClassName) {
+        if (!startupCleanupHookInstalled.compareAndSet(false, true)) {
+            return;
+        }
+
+        try {
+            Class<?> applicationClass = applicationClassName == null
+                    ? Application.class
+                    : classLoader.loadClass(applicationClassName);
+            Method onCreate = applicationClass.getMethod("onCreate");
+
+            hook(onCreate)
+                    .setExceptionMode(ExceptionMode.PROTECTIVE)
+                    .intercept(chain -> {
+                        Object result = chain.proceed();
+                        Object application = chain.getThisObject();
+
+                        applicationReady.set(true);
+                        if (application instanceof Context context) {
+                            clearPersistedState(context);
+                        } else {
+                            log(Log.ERROR, TAG,
+                                    "startup cleanup has no application Context");
+                        }
+                        clearUidPolicies();
+
+                        return result;
+                    });
+
+            log(Log.INFO, TAG,
+                    "startup cleanup hook installed: " + onCreate.toGenericString());
+        } catch (Throwable t) {
+            startupCleanupHookInstalled.set(false);
+            log(Log.ERROR, TAG, "startup cleanup hook installation failed", t);
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private void clearPersistedState(Context context) {
+        if (persistedStateCleared.get()) {
+            return;
+        }
+
+        synchronized (persistedStateCleared) {
+            if (persistedStateCleared.get()) {
+                return;
+            }
+
+            try {
+                int previous = Settings.Secure.getInt(
+                        context.getContentResolver(),
+                        RESTRICTION_SETTING,
+                        -1
+                );
+                boolean updated = Settings.Secure.putInt(
+                        context.getContentResolver(),
+                        RESTRICTION_SETTING,
+                        0
+                );
+                int current = Settings.Secure.getInt(
+                        context.getContentResolver(),
+                        RESTRICTION_SETTING,
+                        -1
+                );
+
+                if (updated && current == 0) {
+                    persistedStateCleared.set(true);
+                    log(Log.INFO, TAG,
+                            "persisted restriction state cleared: " + previous + " -> " + current);
+                } else {
+                    log(Log.ERROR, TAG,
+                            "persisted restriction state clear failed: updated=" + updated
+                                    + ", previous=" + previous + ", current=" + current);
+                }
+            } catch (Throwable t) {
+                log(Log.ERROR, TAG, "persisted restriction state clear failed", t);
+            }
+        }
+    }
+
+    private void clearUidPolicies() {
+        if (uidPolicyCleared.get()) {
+            return;
+        }
+
+        Object instance = controllerInstance.get();
+        Method policyMethod = cleanupPolicyMethod;
+        if (instance == null || policyMethod == null) {
+            return;
+        }
+
+        synchronized (uidPolicyCleared) {
+            if (uidPolicyCleared.get()) {
+                return;
+            }
+
+            try {
+                policyMethod.invoke(instance, false, Collections.emptySet());
+                uidPolicyCleared.set(true);
+                log(Log.INFO, TAG, "persisted UID policies cleared through C(false, emptySet)");
+            } catch (Throwable t) {
+                log(Log.ERROR, TAG, "persisted UID policy cleanup failed", t);
             }
         }
     }
